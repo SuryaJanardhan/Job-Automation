@@ -1,3 +1,4 @@
+const fs = require("fs");
 const path = require("path");
 const { google } = require("googleapis");
 const nodemailer = require("nodemailer");
@@ -33,7 +34,7 @@ function incrementWriteCount() {
 }
 
 async function waitForQuotaReset() {
-  const waitTime = 60000 - (Date.now() - minuteStartTime) + 1000;
+  const waitTime = Math.max(1000, 60000 - (Date.now() - minuteStartTime) + 1000);
   console.log(`  [Quota] Limit reached, waiting ${Math.ceil(waitTime/1000)}s for reset...`);
   await new Promise(resolve => setTimeout(resolve, waitTime));
   resetQuotaIfNewMinute();
@@ -45,9 +46,12 @@ const SHEET_LINK =
 const TARGET_JOBS = Number(process.env.TARGET_JOBS || 10);
 const MAX_RUN_MINUTES = Number(process.env.MAX_RUN_MINUTES || 120);
 const DRY_RUN = process.env.JOB_HUNTER_DRY_RUN === "1";
-const RECIPIENT = "chintalajanardhan2004@gmail.com";
+const RECIPIENT = process.env.JOB_EMAIL_RECIPIENT || "chintalajanardhan2004@gmail.com";
 const FETCH_RETRIES = Number(process.env.JOB_FETCH_RETRIES || 3);
 const FETCH_DELAY_MS = Number(process.env.JOB_FETCH_DELAY_MS || 450);
+const SERVICE_ACCOUNT_FILE =
+  process.env.GOOGLE_SERVICE_ACCOUNT_FILE ||
+  path.join(__dirname, "..", "seismic-rarity-468405-j1-cd12fe29c298.json");
 
 const REQUIRED_HEADERS = [
   "Domains",
@@ -197,12 +201,13 @@ function extractSpreadsheetId(link) {
 }
 
 function getAuth() {
+  if (!fs.existsSync(SERVICE_ACCOUNT_FILE)) {
+    throw new Error(
+      `Missing Google service account file: ${SERVICE_ACCOUNT_FILE}. Set GOOGLE_SERVICE_ACCOUNT_FILE or create the default JSON file.`,
+    );
+  }
   return new google.auth.GoogleAuth({
-    keyFile: path.join(
-      __dirname,
-      "..",
-      "seismic-rarity-468405-j1-cd12fe29c298.json",
-    ),
+    keyFile: SERVICE_ACCOUNT_FILE,
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 }
@@ -220,16 +225,14 @@ async function getFirstSheetTitle(sheets, spreadsheetId) {
 }
 
 async function ensureHeaders(sheets, spreadsheetId, sheetTitle) {
-  if (!canWrite()) {
-    await waitForQuotaReset();
-  }
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${sheetTitle}!A1:F1`,
-    valueInputOption: "RAW",
-    requestBody: { values: [REQUIRED_HEADERS] },
-  });
-  incrementWriteCount();
+  await writeSheetValues(() =>
+    sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${sheetTitle}!A1:F1`,
+      valueInputOption: "RAW",
+      requestBody: { values: [REQUIRED_HEADERS] },
+    }),
+  );
 }
 
 async function loadDomainRows(sheets, spreadsheetId, sheetTitle) {
@@ -241,9 +244,43 @@ async function loadDomainRows(sheets, spreadsheetId, sheetTitle) {
   return rows
     .map((row, idx) => ({
       rowNumber: idx + 2,
-      domain: (row[0] || "").trim(),
+      domain: normalizeDomain(row[0] || ""),
     }))
     .filter((r) => r.domain.length > 0);
+}
+
+function isRetryableError(err) {
+  const message = String(err?.message || err || "").toLowerCase();
+  return ["429", "500", "502", "503", "504", "rate limit", "quota", "econnreset", "etimedout", "socket hang up"].some(
+    (token) => message.includes(token),
+  );
+}
+
+async function withRetry(action, label, attempts = 4, baseDelayMs = 500) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await action();
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= attempts || !isRetryableError(err)) {
+        break;
+      }
+      const backoff = baseDelayMs * attempt + Math.floor(Math.random() * 300);
+      console.log(`  [Retry] ${label} failed (attempt ${attempt}/${attempts}), retrying in ${backoff}ms`);
+      await sleep(backoff);
+    }
+  }
+  throw lastErr || new Error(`${label} failed`);
+}
+
+async function writeSheetValues(action) {
+  if (!canWrite()) {
+    await waitForQuotaReset();
+  }
+  const result = await withRetry(action, "Google Sheets write");
+  incrementWriteCount();
+  return result;
 }
 
 async function fetchWithTimeout(url, timeoutMs = 10000) {
@@ -555,6 +592,9 @@ function extractTitle(html) {
 
 async function scrapeDomain(domain) {
   const cleanDomain = normalizeDomain(domain);
+  if (!cleanDomain) {
+    return { validDomain: false, totalFound: 0, aligned: [] };
+  }
   const seedUrls = [
     `https://${cleanDomain}/careers`,
     `https://${cleanDomain}/career`,
@@ -714,28 +754,24 @@ function oneLine(job) {
 }
 
 async function updateDomainRow(sheets, spreadsheetId, sheetTitle, rowNumber, row) {
-  // Check quota before writing
-  if (!canWrite()) {
-    await waitForQuotaReset();
-  }
-  
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `${sheetTitle}!B${rowNumber}:F${rowNumber}`,
-    valueInputOption: "RAW",
-    requestBody: {
-      values: [
-        [
-          row.validDomain ? "yes" : "no",
-          row.scrappedAt,
-          String(row.totalFound),
-          String(row.alignedCount),
-          row.emailSent,
+  await writeSheetValues(() =>
+    sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${sheetTitle}!B${rowNumber}:F${rowNumber}`,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [
+          [
+            row.validDomain ? "yes" : "no",
+            row.scrappedAt,
+            String(row.totalFound),
+            String(row.alignedCount),
+            row.emailSent,
+          ],
         ],
-      ],
-    },
-  });
-  incrementWriteCount();
+      },
+    }),
+  );
 }
 
 async function sendJobsEmail(jobs) {
@@ -772,6 +808,7 @@ async function sendJobsEmail(jobs) {
 
 async function run() {
   const started = Date.now();
+  const runDeadline = started + MAX_RUN_MINUTES * 60 * 1000;
   const sheets = await getSheetsClient();
   const spreadsheetId = extractSpreadsheetId(SHEET_LINK);
   const sheetTitle = await getFirstSheetTitle(sheets, spreadsheetId);
@@ -787,12 +824,12 @@ async function run() {
 
   while (
     selected.size < TARGET_JOBS &&
-    Date.now() - started < MAX_RUN_MINUTES * 60 * 1000
+    Date.now() < runDeadline
   ) {
     let madeProgress = false;
     for (const domainRow of domains) {
       if (selected.size >= TARGET_JOBS) break;
-      if (Date.now() - started >= MAX_RUN_MINUTES * 60 * 1000) break;
+      if (Date.now() >= runDeadline) break;
       const domain = normalizeDomain(domainRow.domain);
       const now = new Date().toISOString();
 
@@ -829,7 +866,10 @@ async function run() {
     }
 
     if (!madeProgress) {
-      await new Promise((resolve) => setTimeout(resolve, 60000));
+      const remainingMs = runDeadline - Date.now();
+      if (remainingMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(60000, remainingMs)));
+      }
     }
   }
 
@@ -838,6 +878,7 @@ async function run() {
     pickedJobs.length === TARGET_JOBS ? await sendJobsEmail(pickedJobs) : false;
 
   for (const domainRow of domains) {
+    if (Date.now() >= runDeadline) break;
     const prev = domainStats.get(domainRow.rowNumber);
     if (!prev) continue;
     const patch = {

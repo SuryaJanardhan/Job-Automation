@@ -11,6 +11,7 @@ import sys
 import time
 import json
 import argparse
+import tempfile
 import pandas as pd
 import re
 import random
@@ -38,17 +39,37 @@ Thanks! 🙏"""
 # ===========================================
 
 
+def _script_path(filename):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+
+def _atomic_write_json(file_path, payload):
+    directory = os.path.dirname(file_path)
+    fd, temp_path = tempfile.mkstemp(prefix='.linkedin-', suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(payload, handle)
+        os.replace(temp_path, file_path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
 def load_quota():
     """Load today's usage quota."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    quota_path = os.path.join(script_dir, QUOTA_FILE)
-    
+    quota_path = _script_path(QUOTA_FILE)
     today = date.today().isoformat()
     
     if os.path.exists(quota_path):
-        with open(quota_path, 'r') as f:
-            quota = json.load(f)
-        if quota.get('date') != today:
+        try:
+            with open(quota_path, 'r') as f:
+                quota = json.load(f)
+            if quota.get('date') != today:
+                quota = {'date': today, 'sent': 0}
+        except (json.JSONDecodeError, OSError, ValueError):
             quota = {'date': today, 'sent': 0}
     else:
         quota = {'date': today, 'sent': 0}
@@ -58,10 +79,8 @@ def load_quota():
 
 def save_quota(quota):
     """Save current quota."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    quota_path = os.path.join(script_dir, QUOTA_FILE)
-    with open(quota_path, 'w') as f:
-        json.dump(quota, f)
+    quota_path = _script_path(QUOTA_FILE)
+    _atomic_write_json(quota_path, quota)
 
 
 def get_remaining_quota():
@@ -88,10 +107,17 @@ def extract_public_id(linkedin_url):
 
 def load_profiles_from_excel(excel_path, limit=20):
     """Load profiles from Excel file that haven't been contacted yet."""
+    if not os.path.exists(excel_path):
+        raise FileNotFoundError(f'Excel file not found: {excel_path}')
+
     df = pd.read_excel(excel_path)
+    required_columns = {'Name', 'Company Name', 'Linkedin URL', 'Status'}
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Excel file missing required columns: {missing_columns}")
     
-    # Filter rows where Status is empty/NaN (not contacted yet)
-    unsent = df[df['Status'].isna() | (df['Status'] == '')]
+    status_values = df['Status'].fillna('').astype(str).str.strip().str.lower()
+    unsent = df[status_values == '']
     
     profiles = []
     for _, row in unsent.head(limit).iterrows():
@@ -113,25 +139,62 @@ def update_excel_status(excel_path, df, row_index, status, delivered=''):
     df.at[row_index, 'Status'] = status
     if delivered:
         df.at[row_index, 'Delivered'] = delivered
-    df.to_excel(excel_path, index=False)
+    directory = os.path.dirname(os.path.abspath(excel_path))
+    fd, temp_path = tempfile.mkstemp(prefix='.linkedin-', suffix='.xlsx', dir=directory)
+    os.close(fd)
+    try:
+        df.to_excel(temp_path, index=False)
+        os.replace(temp_path, excel_path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def setup_driver(headless=True):
     """Set up undetected Chrome WebDriver to bypass bot detection."""
-    options = uc.ChromeOptions()
-    if headless:
-        options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    options.add_argument('--disable-extensions')
-    options.add_argument('--log-level=3')
-    
-    driver = uc.Chrome(options=options, use_subprocess=True, version_main=140)
+    def apply_common_flags(options):
+        if headless:
+            options.add_argument('--headless=new')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-extensions')
+        options.add_argument('--log-level=3')
+
+    uc_options = uc.ChromeOptions()
+    apply_common_flags(uc_options)
+
+    try:
+        driver = uc.Chrome(options=uc_options, use_subprocess=True)
+    except Exception:
+        fallback_options = webdriver.ChromeOptions()
+        apply_common_flags(fallback_options)
+        driver = webdriver.Chrome(options=fallback_options)
+
     driver.set_page_load_timeout(120)
     driver.implicitly_wait(15)
     return driver
+
+
+def build_message(message, resume_link):
+    """Build the final DM payload and ensure the resume link is included."""
+    chosen_resume = (resume_link or '').strip() or RESUME_LINK
+    if not message:
+        base_message = DEFAULT_MESSAGE
+        if chosen_resume != RESUME_LINK:
+            base_message = base_message.replace(RESUME_LINK, chosen_resume)
+        return base_message
+
+    normalized_message = message.strip()
+    if '{resume}' in normalized_message:
+        return normalized_message.replace('{resume}', chosen_resume)
+    if chosen_resume not in normalized_message:
+        normalized_message = f"{normalized_message}\n\nResume: {chosen_resume}"
+    return normalized_message
 
 
 def login_with_cookie(driver, li_at_cookie):
@@ -479,9 +542,8 @@ def main():
     if effective_limit < args.limit:
         print(f"⚠️ Limiting to {effective_limit} due to daily quota")
     
-    # Build message - use hardcoded default
-    if not args.message:
-        args.message = DEFAULT_MESSAGE
+    # Build message with the requested resume link or the default fallback.
+    args.message = build_message(args.message, args.resume)
     
     # Trim to 300 chars (LinkedIn limit)
     if len(args.message) > 300:
@@ -491,6 +553,7 @@ def main():
     print(f"   {args.message[:100]}...")
     print()
     
+    driver = None
     try:
         # Load profiles
         print(f"📂 Loading profiles from Excel...")
@@ -516,7 +579,6 @@ def main():
         
         if not logged_in:
             print("❌ Authentication failed!")
-            driver.quit()
             sys.exit(1)
         print("✅ Authenticated!\n")
         
@@ -591,6 +653,12 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
