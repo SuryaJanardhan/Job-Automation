@@ -1,85 +1,79 @@
 const nodemailer = require("nodemailer");
 const path = require("path");
+const { compileTemplate } = require("../src/template");
 require("dotenv").config();
 
 /**
  * Phase 3: Send emails in batches
  * @returns {Object} Object containing sent emails and message info
  */
-async function sendEmails(batch, subject, body, resumeLink) {
-  // Configure transporter - Using Gmail SMTP
+async function sendEmails(batch, subjectTemplate, bodyTemplate, resumeLink) {
   const transporter = nodemailer.createTransport({
     service: "gmail",
     auth: {
       user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS, // Use app password for Gmail
+      pass: process.env.EMAIL_PASS,
     },
   });
 
   const sentEmails = [];
-  const messageIds = []; // Store Message-IDs for tracking
+  const messageIds = [];
 
-  // Send ONE email BCC'd to all recipients in the batch
-  const bccRecipients = batch.map((emailObj) => emailObj.email);
+  const isDryRun = process.env.DRY_RUN === "true" || process.env.DRY_RUN === "1";
 
-  // Keep all recipients (don't remove duplicates)
-  const allRecipients = bccRecipients;
+  // Compile templates
+  const renderSubject = compileTemplate(subjectTemplate);
+  const renderBody = compileTemplate(bodyTemplate + "\n\nResume: {{resumeLink}}");
 
-  console.log(
-    `Sending to ${allRecipients.length} recipients (including duplicates)`,
-  );
+  for (const recipient of batch) {
+    const data = { ...recipient, resumeLink };
+    const personalizedSubject = renderSubject(data);
+    const personalizedBody = renderBody(data);
 
-  // No file attachment - resume link is in the body
-  const mailOptions = {
-    from: process.env.EMAIL_USER,
-    bcc: allRecipients, // BCC to all emails in batch
-    subject: subject,
-    text: body,
-  };
+    const mailOptions = {
+      from: process.env.EMAIL_USER,
+      to: recipient.email,
+      subject: personalizedSubject,
+      text: personalizedBody,
+    };
 
-  try {
-    const info = await transporter.sendMail(mailOptions);
-    sentEmails.push(...allRecipients); // All recipients are sent to
+    try {
+      if (isDryRun) {
+        console.log(`DRY RUN: would send to ${recipient.email} subject="${personalizedSubject.substring(0,50)}..."`);
+      } else {
+        const info = await transporter.sendMail(mailOptions);
+        if (info && info.messageId) messageIds.push(info.messageId);
+        console.log(`Sent to ${recipient.email} (${info && info.response ? info.response : 'no-response'})`);
+      }
 
-    // Store the Message-ID for bounce tracking
-    if (info.messageId) {
-      messageIds.push(info.messageId);
-      console.log(`Message-ID: ${info.messageId}`);
+      sentEmails.push(recipient.email);
+    } catch (error) {
+      console.error(`Failed to send to ${recipient.email}:`, error && error.message ? error.message : error);
     }
 
-    console.log(`Batch email sent to ${allRecipients.length} recipients`);
-    console.log(`SMTP Response: ${info.response}`);
-
-    // sending a confirm mail to my primary mail here
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: "chintalajanardhan2004@gmail.com",
-      subject: `✅ Batch of ${allRecipients.length} mails sent successfully`,
-      text: `✅ Successfully sent ${
-        allRecipients.length
-      } emails to the following recipients:\n\n${allRecipients.join(
-        "\n",
-      )}\n\nTotal recipients: ${
-        allRecipients.length
-      }\n\nSubject used: ${subject}\n\nMessage-ID: ${info.messageId || "N/A"}\n\nSMTP Response: ${info.response}`,
-    });
-
-    return { sentEmails, messageIds };
-  } catch (error) {
-    console.error(`Failed to send batch email:`, error);
-    await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: "chintalajanardhan2004@gmail.com",
-      subject: `❌ Failed to send batch of ${allRecipients.length} mails`,
-      text: `🚨 Failed to send batch email to the following recipients:\n\n${allRecipients.join(
-        "\n",
-      )}\n\nError: ${
-        error.message
-      }\n\nPlease check your email configuration and try again.`,
-    });
-
-    return { sentEmails, messageIds };
+    // Small pause to avoid hitting provider rate limits
+    await new Promise((r) => setTimeout(r, 250));
   }
+
+  // Notify owner about the batch result
+  try {
+    const ownerMsg = {
+      from: process.env.EMAIL_USER,
+      to: process.env.EMAIL_USER,
+      subject: `Batch send report: ${sentEmails.length}/${batch.length} sent`,
+      text: `Sent to:\n${sentEmails.join("\n")}\n\nSubject (sample): ${subjectTemplate.substring(0,80)}`,
+    };
+    if (isDryRun) {
+      console.log("DRY RUN: would send owner report", ownerMsg);
+    } else {
+      const info = await transporter.sendMail(ownerMsg);
+      if (info && info.messageId) messageIds.push(info.messageId);
+    }
+  } catch (err) {
+    console.error("Failed to send owner report:", err && err.message ? err.message : err);
+  }
+
+  return { sentEmails, messageIds };
 }
 
 module.exports = { sendEmails };

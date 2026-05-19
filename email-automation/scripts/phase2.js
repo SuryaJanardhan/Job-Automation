@@ -1,4 +1,5 @@
 /**
+ * 
  * Phase 2: Prepare batches of 30 emails each
  * @returns {Array} Array of batches, each containing up to batchSize emails
  */
